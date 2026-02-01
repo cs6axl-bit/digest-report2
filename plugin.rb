@@ -24,7 +24,11 @@ after_initialize do
 
     # Tracking pixel endpoint (must return an actual tiny image)
     # Example: https://ai.templetrends.com/digest_open.php?email_id=...&user_id=...&user_email=...
-    OPEN_TRACKING_PIXEL_BASE_URL = "https://ai.templetrends.com/digest_open.php"
+    
+    # OPEN_TRACKING_PIXEL_BASE_URL = "https://ai.templetrends.com/digest_open.php"
+
+    OPEN_TRACKING_PIXEL_BASE_URL = "#{Discourse.base_url}/digest/open.gif"
+
 
     # If we can't find an email_id in any link, use this
     DEFAULT_EMAIL_ID = "99999999"
