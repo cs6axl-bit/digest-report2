@@ -1,6 +1,8 @@
+# frozen_string_literal: true
+
 # name: digest-report2
 # about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel + debug logs
-# version: 1.6
+# version: 1.6.1
 # authors: you
 
 after_initialize do
@@ -23,12 +25,14 @@ after_initialize do
     OPEN_TRACKING_ENABLED = true
 
     # Tracking pixel endpoint (must return an actual tiny image)
-    # Example: https://ai.templetrends.com/digest_open.php?email_id=...&user_id=...&user_email=...
-    
-    # OPEN_TRACKING_PIXEL_BASE_URL = "https://ai.templetrends.com/digest_open.php"
-
-    OPEN_TRACKING_PIXEL_BASE_URL = "#{Discourse.base_url}/digest/open.gif"
-
+    #
+    # IMPORTANT:
+    # Use NO-extension route to avoid nginx/static handling for *.gif
+    #   https://forum.example.com/digest/open?email_id=...&user_id=...&user_email=...
+    #
+    # If you still want legacy, your pixel plugin can keep /digest/open.gif too,
+    # but this plugin will now use /digest/open.
+    OPEN_TRACKING_PIXEL_BASE_URL = "#{Discourse.base_url}/digest/open"
 
     # If we can't find an email_id in any link, use this
     DEFAULT_EMAIL_ID = "99999999"
@@ -259,7 +263,7 @@ after_initialize do
       []
     end
 
-    # NEW: Extract email_id from FIRST link that contains email_id=...
+    # Extract email_id from FIRST link that contains email_id=...
     def self.extract_email_id_from_message(message)
       body = extract_email_body(message)
       return "" if body.to_s.empty?
@@ -349,10 +353,15 @@ after_initialize do
       ""
     end
 
+    # UPDATED: treat either /digest/open OR /digest/open.gif as "already has pixel"
     def self.message_already_has_pixel?(mail_message)
       b = extract_email_body(mail_message)
       return false if b.to_s.empty?
-      b.include?(OPEN_TRACKING_PIXEL_BASE_URL.to_s.strip)
+
+      base = OPEN_TRACKING_PIXEL_BASE_URL.to_s.strip
+      legacy = base.end_with?("/digest/open") ? (base + ".gif") : "#{Discourse.base_url}/digest/open.gif"
+
+      b.include?(base) || b.include?(legacy)
     rescue StandardError
       false
     end
