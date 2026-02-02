@@ -23,7 +23,7 @@ after_initialize do
     # =========================
     ENABLED = true
 
-    ENDPOINT_URL = "https://ai.templetrends.com/digest_report.php"
+    ENDPOINT_URL = "http://172.17.0.1:8081/digest_report.php"
 
     # ===== Open tracking switch =====
     OPEN_TRACKING_ENABLED = true
