@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
 # name: digest-report2
-# about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel + debug logs
-# version: 1.7.0
+# about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel + debug logs + increments user's digest_sent_counter
+# version: 1.7.1
 # authors: you
 
 after_initialize do
@@ -39,7 +39,7 @@ after_initialize do
     # Query: /digest/open?t=v1.<urlsafe_b64(iv|tag|ciphertext)>
     #
     # Put 64 hex chars here (32 bytes). Same key must be in PHP + digest-open-tracker.
-    TOKEN_KEY_HEX = "7c4d2a1f9b8e0c3d4f6a7b8c9d0e1f2233445566778899aabbccddeeff001122" 
+    TOKEN_KEY_HEX = "7c4d2a1f9b8e0c3d4f6a7b8c9d0e1f2233445566778899aabbccddeeff001122"
 
     TOKEN_PREFIX = "v1" # token format version
     TOKEN_MAX_LEN = 2000 # sanity cap
@@ -73,6 +73,9 @@ after_initialize do
     WRITE_TIMEOUT_SECONDS = 3
 
     JOB_RETRY_COUNT = 2
+
+    # ===== Digest counter custom field =====
+    DIGEST_COUNTER_FIELD = "digest_sent_counter"
     # =========================
 
     STORE_NAMESPACE = PLUGIN_NAME
@@ -172,6 +175,34 @@ after_initialize do
       rescue StandardError
         false
       end
+    end
+
+    # =========================
+    # DIGEST COUNTER INCREMENT
+    # =========================
+    def self.increment_digest_counter_for_user(user)
+      return false if user.nil?
+      field = DIGEST_COUNTER_FIELD.to_s.strip
+      return false if field.empty?
+
+      User.transaction do
+        u = User.lock.find(user.id)
+
+        # Ensure custom_fields are loaded
+        u.custom_fields ||= {}
+
+        cur_raw = u.custom_fields[field]
+        cur = cur_raw.to_i
+        cur = 0 if cur < 0
+
+        u.custom_fields[field] = (cur + 1).to_s
+        u.save_custom_fields(true)
+      end
+
+      true
+    rescue StandardError => e
+      dlog_error("increment_digest_counter_for_user failed user_id=#{user&.id} err=#{e.class}: #{e.message}")
+      false
     end
 
     def self.extract_email_body(message)
@@ -590,7 +621,7 @@ after_initialize do
     end
   end
 
-  # After email send: enqueue postback (unchanged core logic)
+  # After email send: increment counter + enqueue postback
   DiscourseEvent.on(:after_email_send) do |message, email_type|
     begin
       next unless ::DigestReport.enabled?
@@ -606,6 +637,11 @@ after_initialize do
         user = User.find_by_email(recipient) unless recipient.empty?
       rescue StandardError
         user = nil
+      end
+
+      # +1 digest_sent_counter (create if missing -> becomes "1")
+      if user
+        ::DigestReport.increment_digest_counter_for_user(user)
       end
 
       uid = user ? user.id : 0
