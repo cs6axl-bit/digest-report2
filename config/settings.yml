@@ -1,22 +1,27 @@
+# config/settings.yml
+
 plugins:
   digest_report2_enabled:
-    default: true
-    client: true
+    default: false
+    client: false
 
   digest_report2_endpoint_url:
-    default: "http://172.17.0.1:8081/digest_report.php"
+    default: ""
     client: false
 
   digest_report2_open_tracking_enabled:
-    default: true
-    client: true
+    default: false
+    client: false
 
-  # Optional: force pixel domain (leave blank to use first link domain)
-  # You may set: example.com  OR  https://example.com
+  # Optional: if set, pixel (and Message-ID swap) will prefer this domain.
+  # Accepts "example.com" or "https://example.com"
   digest_report2_pixel_domain_override:
     default: ""
-    client: true
+    client: false
 
+  # NEW: If enabled, rewrites Message-ID domain to:
+  #  - pixel_domain_override host (if set), else
+  #  - first link host found in the email body
   digest_report2_message_id_domain_swap_enabled:
     default: false
     client: false
