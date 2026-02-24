@@ -1,8 +1,8 @@
 # frozen_string_literal: true
-
+#
 # name: digest-report2
 # about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel + debug logs + increments user's digest_sent_counter
-# version: 1.9.0
+# version: 1.10.0
 # authors: you
 
 after_initialize do
@@ -47,6 +47,14 @@ after_initialize do
       SiteSetting.digest_report2_pixel_domain_override.to_s.strip
     rescue StandardError
       ""
+    end
+
+    # NEW: Message-ID domain swapping switch
+    def self.message_id_domain_swap_enabled?
+      return false unless SiteSetting.digest_report2_message_id_domain_swap_enabled
+      true
+    rescue StandardError
+      false
     end
 
     # =========================
@@ -270,7 +278,7 @@ after_initialize do
       end
     end
 
-    # NEW: get base URL (scheme://host[:port]) from FIRST found link in email body
+    # get base URL (scheme://host[:port]) from FIRST found link in email body
     def self.first_link_base_url_from_message(message)
       body = extract_email_body(message)
       urls = extract_urls_from_body(body)
@@ -295,6 +303,48 @@ after_initialize do
       ""
     rescue StandardError
       ""
+    end
+
+    # NEW: host (domain) from the first found link (no scheme)
+    def self.first_link_host_from_message(message)
+      base = first_link_base_url_from_message(message)
+      return "" if base.to_s.strip.empty?
+      uri = (URI.parse(base) rescue nil)
+      return "" if uri.nil?
+      uri.host.to_s.strip
+    rescue StandardError
+      ""
+    end
+
+    # NEW: swap Message-ID domain -> first link host
+    # Example: <uuid@myhealthyhaven.org> -> <uuid@newdomain.com>
+    def self.swap_message_id_domain!(mail_message, target_host)
+      return false if mail_message.nil?
+      host = target_host.to_s.strip
+      return false if host.empty?
+
+      raw = header_val(mail_message, "Message-ID")
+      return false if raw.empty?
+
+      # Try to normalize: allow with/without angle brackets
+      s = raw.strip
+      s = s[1..-2].to_s.strip if s.start_with?("<") && s.end_with?(">")
+      return false unless s.include?("@")
+
+      local, dom = s.split("@", 2)
+      local = local.to_s.strip
+      dom   = dom.to_s.strip
+      return false if local.empty? || dom.empty?
+
+      return true if dom.downcase == host.downcase # already swapped
+
+      new_mid = "<#{local}@#{host}>"
+      mail_message.header["Message-ID"] = new_mid
+      dlog("Message-ID swapped: #{raw} -> #{new_mid}")
+      true
+    rescue StandardError => e
+      dlog_error("swap_message_id_domain failed err=#{e.class}: #{e.message}")
+      false
     end
 
     def self.extract_topic_ids_from_message(message)
@@ -414,7 +464,7 @@ after_initialize do
       ""
     end
 
-    # NEW: Build pixel base using:
+    # Build pixel base using:
     #  (1) override domain if provided
     #  (2) else first found link's domain
     #  (3) else fallback to Discourse.base_url
@@ -557,7 +607,7 @@ after_initialize do
     end
   end
 
-  # BEFORE send: extract email_id + inject pixel + stamp headers
+  # BEFORE send: extract email_id + inject pixel + stamp headers + (NEW) Message-ID swap
   DiscourseEvent.on(:before_email_send) do |message, email_type|
     begin
       next unless ::DigestReport.enabled?
@@ -581,6 +631,16 @@ after_initialize do
       if email_id.to_s.strip.empty?
         email_id = ::DigestReport::DEFAULT_EMAIL_ID
         ::DigestReport.dlog("before_email_send: email_id missing -> DEFAULT=#{email_id}")
+      end
+
+      # NEW: swap Message-ID domain to first link host (optional switch)
+      if ::DigestReport.message_id_domain_swap_enabled?
+        target_host = ::DigestReport.first_link_host_from_message(message)
+        if target_host.to_s.strip.empty?
+          ::DigestReport.dlog("Message-ID swap: first link host not found -> skip")
+        else
+          ::DigestReport.swap_message_id_domain!(message, target_host)
+        end
       end
 
       injected = false
