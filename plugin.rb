@@ -1,5 +1,4 @@
 # frozen_string_literal: true
-#
 # name: digest-report2
 # about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel + debug logs + increments user's digest_sent_counter
 # version: 1.10.1
