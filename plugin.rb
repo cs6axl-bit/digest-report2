@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: digest-report2
-# about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel + debug logs + increments user's digest_sent_counter
-# version: 1.10.3
+# about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel + optional Message-ID domain swap + debug logs + increments user's digest_sent_counter
+# version: 1.11.0
 # authors: you
 
 after_initialize do
@@ -18,7 +18,7 @@ after_initialize do
     PLUGIN_NAME = "digest-report2"
 
     # =========================
-    # SETTINGS (now from SiteSettings)
+    # SETTINGS (SiteSettings)
     # =========================
     def self.enabled?
       return false unless SiteSetting.digest_report2_enabled
@@ -35,44 +35,27 @@ after_initialize do
     end
 
     def self.open_tracking_enabled?
-      return false unless SiteSetting.digest_report2_open_tracking_enabled
-      true
+      !!SiteSetting.digest_report2_open_tracking_enabled
     rescue StandardError
       false
     end
 
-    # Optional override (if set, always used for pixel domain)
-    def self.pixel_domain_override
-      SiteSetting.digest_report2_pixel_domain_override.to_s.strip
-    rescue StandardError
-      ""
-    end
-
-    # Message-ID domain swapping switch
-    def self.message_id_domain_swap_enabled?
-      return false unless SiteSetting.digest_report2_message_id_domain_swap_enabled
-      true
+    def self.message_id_swap_enabled?
+      !!SiteSetting.digest_report2_message_id_swap_enabled
     rescue StandardError
       false
     end
 
-    # NEW: checkbox - use Discourse default hostname as "origin to swap"
-    def self.message_id_domain_swap_use_default_hostname?
-      return false unless SiteSetting.digest_report2_message_id_domain_swap_use_default_hostname
-      true
-    rescue StandardError
-      false
-    end
-
-    # NEW: manual origin domain (only used when checkbox above is OFF)
-    def self.message_id_domain_swap_origin_domain
-      SiteSetting.digest_report2_message_id_domain_swap_origin_domain.to_s.strip
+    # Optional: if set, use this host for BOTH pixel + Message-ID swap target
+    # If blank: derive from first found <a href="http(s)://..."> link.
+    def self.target_domain_override
+      SiteSetting.digest_report2_target_domain_override.to_s.strip
     rescue StandardError
       ""
     end
 
     # =========================
-    # HARD-CODED SETTINGS (keep here)
+    # HARD-CODED SETTINGS
     # =========================
     DEFAULT_EMAIL_ID = "99999999"
 
@@ -127,7 +110,6 @@ after_initialize do
 
     # ===== Digest counter custom field =====
     DIGEST_COUNTER_FIELD = "digest_sent_counter"
-    # =========================
 
     STORE_NAMESPACE = PLUGIN_NAME
     def self.store_key_last_email_id(user_id)
@@ -299,11 +281,9 @@ after_initialize do
 
       s = html.to_s
 
-      # Try double quotes first
       m = s.match(/<a\b[^>]*\bhref\s*=\s*"((?:https?:\/\/)[^"]+)"/i)
       return m[1].to_s.strip if m && m[1]
 
-      # Then single quotes
       m = s.match(/<a\b[^>]*\bhref\s*=\s*'((?:https?:\/\/)[^']+)'/i)
       return m[1].to_s.strip if m && m[1]
 
@@ -312,33 +292,36 @@ after_initialize do
       ""
     end
 
-    # Return first "real link":
-    #  - if HTML: first <a href="http(s)://...">
-    #  - else fallback: first http(s)://... anywhere (plain text)
     def self.first_link_url_from_message(message)
       body = extract_email_body(message)
       return "" if body.to_s.empty?
 
-      # Prefer <a href> if it looks like HTML
       if body.include?("<a") || body.include?("<html") || body.include?("<body")
         href = first_href_link_from_html(body)
         return href unless href.to_s.empty?
       end
 
-      # Fallback: scan any URL
       urls = extract_urls_from_body(body)
       urls.each do |raw|
         next if raw.to_s.empty?
         u = raw.to_s.gsub(/[)\].,;]+$/, "")
-
         uri = (URI.parse(u) rescue nil)
         next if uri.nil?
         next if uri.scheme.to_s.empty? || uri.host.to_s.empty?
-
         return u
       end
 
       ""
+    rescue StandardError
+      ""
+    end
+
+    def self.first_link_host_from_message(message)
+      u = first_link_url_from_message(message)
+      return "" if u.to_s.strip.empty?
+      uri = (URI.parse(u) rescue nil)
+      return "" if uri.nil?
+      uri.host.to_s.strip
     rescue StandardError
       ""
     end
@@ -363,25 +346,26 @@ after_initialize do
       ""
     end
 
-    def self.first_link_host_from_message(message)
-      u = first_link_url_from_message(message)
-      return "" if u.to_s.strip.empty?
-      uri = (URI.parse(u) rescue nil)
-      return "" if uri.nil?
-      uri.host.to_s.strip
+    # Discourse hostname (origin) for swapping
+    def self.discourse_origin_host
+      uri = (URI.parse(Discourse.base_url.to_s) rescue nil)
+      uri&.host.to_s.strip
     rescue StandardError
       ""
     end
 
-    # Prefer override if present; else first-link host; else blank
-    def self.resolve_message_id_target_host(mail_message)
-      ovr = pixel_domain_override.to_s.strip
+    # Target host:
+    #  - if override present -> that host
+    #  - else first <a href> host (or fallback url host)
+    def self.resolve_target_host(mail_message)
+      ovr = target_domain_override.to_s.strip
       if !ovr.empty?
         begin
           s = ovr
           s = "https://#{s}" unless s =~ %r{\Ahttps?://}i
           uri = (URI.parse(s) rescue nil)
-          return uri.host.to_s.strip if uri && uri.host.to_s.strip != ""
+          h = uri&.host.to_s.strip
+          return h if !h.empty?
         rescue StandardError
         end
       end
@@ -391,44 +375,45 @@ after_initialize do
       ""
     end
 
-    # NEW: resolve origin host for Message-ID swapping
-    # - if checkbox ON: origin = Discourse.base_url host
-    # - else: origin = setting digest_report2_message_id_domain_swap_origin_domain (may be blank)
-    def self.resolve_message_id_origin_host
-      if message_id_domain_swap_use_default_hostname?
+    # Pixel base URL:
+    # - if override present -> use https://override (or scheme if provided)
+    # - else use scheme+host(+port) from the first found link
+    # - else fallback to Discourse.base_url
+    def self.resolve_pixel_base_url(mail_message)
+      ovr = target_domain_override.to_s.strip
+      if !ovr.empty?
         begin
-          uri = URI.parse(Discourse.base_url.to_s) rescue nil
-          h = uri&.host.to_s.strip
-          return h
+          s = ovr
+          s = "https://#{s}" unless s =~ %r{\Ahttps?://}i
+          uri = (URI.parse(s) rescue nil)
+          if uri && uri.scheme.to_s != "" && uri.host.to_s != ""
+            scheme = uri.scheme.to_s.downcase
+            host = uri.host.to_s
+            port = uri.port.to_i
+            default_port = (scheme == "https" ? 443 : 80)
+            port_part = (port > 0 && port != default_port) ? ":#{port}" : ""
+            return "#{scheme}://#{host}#{port_part}"
+          end
         rescue StandardError
-          return ""
         end
       end
 
-      # manual origin host (can be blank => "swap anything")
-      raw = message_id_domain_swap_origin_domain.to_s.strip
-      return "" if raw.empty?
+      from_link = first_link_base_url_from_message(mail_message)
+      return from_link unless from_link.empty?
 
-      begin
-        s = raw
-        s = "https://#{s}" unless s =~ %r{\Ahttps?://}i
-        uri = URI.parse(s) rescue nil
-        h = uri&.host.to_s.strip
-        return h if !h.empty?
-      rescue StandardError
-      end
-
-      ""
+      Discourse.base_url.to_s
     rescue StandardError
-      ""
+      Discourse.base_url.to_s
     end
 
-    # swap Message-ID domain -> target_host, but ONLY if current domain matches origin_host (unless origin_host blank)
-    # Example: <uuid@old.com> -> <uuid@new.com>
-    def self.swap_message_id_domain!(mail_message, target_host, origin_host: "")
+    # Swap Message-ID domain from discourse hostname -> target host
+    def self.swap_message_id_domain_from_discourse!(mail_message, target_host)
       return false if mail_message.nil?
       host = target_host.to_s.strip
       return false if host.empty?
+
+      origin = discourse_origin_host
+      return false if origin.to_s.strip.empty?
 
       raw = header_val(mail_message, "Message-ID")
       return false if raw.empty?
@@ -442,10 +427,9 @@ after_initialize do
       dom   = dom.to_s.strip
       return false if local.empty? || dom.empty?
 
-      # If origin_host specified, only swap if it matches current dom
-      oh = origin_host.to_s.strip
-      if !oh.empty? && dom.downcase != oh.downcase
-        dlog("Message-ID swap: origin mismatch dom=#{dom} origin=#{oh} -> skip")
+      # Only swap if current domain matches discourse hostname
+      if dom.downcase != origin.downcase
+        dlog("Message-ID swap: current=#{dom} origin(discord)=#{origin} -> skip")
         return false
       end
 
@@ -453,10 +437,10 @@ after_initialize do
 
       new_mid = "<#{local}@#{host}>"
       mail_message.header["Message-ID"] = new_mid
-      dlog("Message-ID swapped: #{raw} -> #{new_mid} (origin=#{oh.empty? ? 'ANY' : oh})")
+      dlog("Message-ID swapped: #{raw} -> #{new_mid}")
       true
     rescue StandardError => e
-      dlog_error("swap_message_id_domain failed err=#{e.class}: #{e.message}")
+      dlog_error("swap_message_id_domain_from_discourse failed err=#{e.class}: #{e.message}")
       false
     end
 
@@ -577,37 +561,6 @@ after_initialize do
       ""
     end
 
-    # Pixel base:
-    #  (1) override domain if provided
-    #  (2) else first found *LINK* (<a href>) domain
-    #  (3) else fallback to Discourse.base_url
-    def self.resolve_pixel_base_url(mail_message)
-      ovr = pixel_domain_override
-      if !ovr.empty?
-        begin
-          s = ovr
-          s = "https://#{s}" unless s =~ %r{\Ahttps?://}i
-          uri = URI.parse(s) rescue nil
-          if uri && uri.scheme.to_s != "" && uri.host.to_s != ""
-            scheme = uri.scheme.to_s.downcase
-            host = uri.host.to_s
-            port = uri.port.to_i
-            default_port = (scheme == "https" ? 443 : 80)
-            port_part = (port > 0 && port != default_port) ? ":#{port}" : ""
-            return "#{scheme}://#{host}#{port_part}"
-          end
-        rescue StandardError
-        end
-      end
-
-      from_link = first_link_base_url_from_message(mail_message)
-      return from_link unless from_link.empty?
-
-      Discourse.base_url.to_s
-    rescue StandardError
-      Discourse.base_url.to_s
-    end
-
     def self.build_tracking_pixel_html(mail_message, email_id:, user_id:, user_email:)
       return "" if email_id.to_s.strip.empty?
 
@@ -650,7 +603,7 @@ after_initialize do
 
       pixel = build_tracking_pixel_html(mail_message, email_id: email_id, user_id: user_id, user_email: user_email)
       if pixel.to_s.empty?
-        dlog("inject: pixel html empty (missing token/key? base url?) -> fail")
+        dlog("inject: pixel html empty -> fail")
         return false
       end
 
@@ -717,7 +670,7 @@ after_initialize do
     end
   end
 
-  # BEFORE send: extract email_id + inject pixel + stamp headers + Message-ID swap (optional)
+  # BEFORE send: extract email_id + inject pixel (optional) + stamp headers + Message-ID swap (optional)
   DiscourseEvent.on(:before_email_send) do |message, email_type|
     begin
       next unless ::DigestReport.enabled?
@@ -743,16 +696,13 @@ after_initialize do
         ::DigestReport.dlog("before_email_send: email_id missing -> DEFAULT=#{email_id}")
       end
 
-      # Message-ID swap:
-      # - target host = override host if set; else first-link host
-      # - origin host = (NEW) default discourse hostname if checkbox ON; else manual origin domain (or blank => any)
-      if ::DigestReport.message_id_domain_swap_enabled?
-        target_host = ::DigestReport.resolve_message_id_target_host(message)
+      # Message-ID swap: ALWAYS from Discourse hostname -> (override OR first href host)
+      if ::DigestReport.message_id_swap_enabled?
+        target_host = ::DigestReport.resolve_target_host(message)
         if target_host.to_s.strip.empty?
           ::DigestReport.dlog("Message-ID swap: no target host resolved -> skip")
         else
-          origin_host = ::DigestReport.resolve_message_id_origin_host
-          ::DigestReport.swap_message_id_domain!(message, target_host, origin_host: origin_host)
+          ::DigestReport.swap_message_id_domain_from_discourse!(message, target_host)
         end
       end
 
@@ -778,6 +728,8 @@ after_initialize do
         open_tracking_used: open_used,
         user_id: uid
       )
+
+      ::DigestReport.dlog("before_email_send: uid=#{uid} email=#{recipient} email_id=#{email_id} pixel=#{open_used} mid_swap=#{::DigestReport.message_id_swap_enabled? ? '1' : '0'}")
 
       if uid > 0 && !email_id.to_s.strip.empty? && email_id.to_s != ::DigestReport::DEFAULT_EMAIL_ID
         ::DigestReport.store_last_email_id_for_user(uid, email_id)
