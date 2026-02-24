@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: digest-report2
-# about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel + optional Message-ID domain swap + debug logs + increments user's digest_sent_counter
-# version: 1.11.0
+# about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel + optional Message-ID domain swap + optional switch to force pixel to use Discourse base_url + debug logs + increments user's digest_sent_counter
+# version: 1.12.0
 # authors: you
 
 after_initialize do
@@ -46,7 +46,17 @@ after_initialize do
       false
     end
 
-    # Optional: if set, use this host for BOTH pixel + Message-ID swap target
+    # NEW:
+    # If true, tracking pixel URL ALWAYS uses Discourse.base_url (default Discourse domain),
+    # ignoring override/first-link swapping rules.
+    # If false, pixel follows the existing "swap/target domain" resolution rules.
+    def self.pixel_force_discourse_domain?
+      !!SiteSetting.digest_report2_pixel_force_discourse_domain
+    rescue StandardError
+      false
+    end
+
+    # Optional: if set, use this host for BOTH pixel + Message-ID swap target (when not forcing Discourse pixel domain)
     # If blank: derive from first found <a href="http(s)://..."> link.
     def self.target_domain_override
       SiteSetting.digest_report2_target_domain_override.to_s.strip
@@ -376,10 +386,15 @@ after_initialize do
     end
 
     # Pixel base URL:
-    # - if override present -> use https://override (or scheme if provided)
-    # - else use scheme+host(+port) from the first found link
-    # - else fallback to Discourse.base_url
+    # NEW switch:
+    # - if pixel_force_discourse_domain? -> ALWAYS Discourse.base_url
+    # - else:
+    #   - if override present -> use https://override (or scheme if provided)
+    #   - else use scheme+host(+port) from the first found link
+    #   - else fallback to Discourse.base_url
     def self.resolve_pixel_base_url(mail_message)
+      return Discourse.base_url.to_s if pixel_force_discourse_domain?
+
       ovr = target_domain_override.to_s.strip
       if !ovr.empty?
         begin
@@ -729,7 +744,11 @@ after_initialize do
         user_id: uid
       )
 
-      ::DigestReport.dlog("before_email_send: uid=#{uid} email=#{recipient} email_id=#{email_id} pixel=#{open_used} mid_swap=#{::DigestReport.message_id_swap_enabled? ? '1' : '0'}")
+      ::DigestReport.dlog(
+        "before_email_send: uid=#{uid} email=#{recipient} email_id=#{email_id} " \
+        "pixel=#{open_used} mid_swap=#{::DigestReport.message_id_swap_enabled? ? '1' : '0'} " \
+        "pixel_force_discourse=#{::DigestReport.pixel_force_discourse_domain? ? '1' : '0'}"
+      )
 
       if uid > 0 && !email_id.to_s.strip.empty? && email_id.to_s != ::DigestReport::DEFAULT_EMAIL_ID
         ::DigestReport.store_last_email_id_for_user(uid, email_id)
