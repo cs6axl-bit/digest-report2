@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: digest-report2
 # about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel + debug logs + increments user's digest_sent_counter
-# version: 1.10.1
+# version: 1.10.2
 # authors: you
 
 after_initialize do
@@ -266,6 +266,7 @@ after_initialize do
       end
     end
 
+    # Extract candidate URLs from raw body (fallback for plain text)
     def self.extract_urls_from_body(body)
       return [] if body.to_s.empty?
       begin
@@ -276,9 +277,40 @@ after_initialize do
       end
     end
 
-    # get base URL (scheme://host[:port]) from FIRST found link in email body
-    def self.first_link_base_url_from_message(message)
+    # Return the first <a ... href="http(s)://..."> (or single-quoted) from HTML
+    # No Nokogiri: regex-based.
+    def self.first_href_link_from_html(html)
+      return "" if html.to_s.empty?
+
+      s = html.to_s
+
+      # Try double quotes first
+      m = s.match(/<a\b[^>]*\bhref\s*=\s*"((?:https?:\/\/)[^"]+)"/i)
+      return m[1].to_s.strip if m && m[1]
+
+      # Then single quotes
+      m = s.match(/<a\b[^>]*\bhref\s*=\s*'((?:https?:\/\/)[^']+)'/i)
+      return m[1].to_s.strip if m && m[1]
+
+      ""
+    rescue StandardError
+      ""
+    end
+
+    # Return first "real link":
+    #  - if HTML: first <a href="http(s)://...">
+    #  - else fallback: first http(s)://... anywhere (plain text)
+    def self.first_link_url_from_message(message)
       body = extract_email_body(message)
+      return "" if body.to_s.empty?
+
+      # Prefer <a href> if it looks like HTML
+      if body.include?("<a") || body.include?("<html") || body.include?("<body")
+        href = first_href_link_from_html(body)
+        return href unless href.to_s.empty?
+      end
+
+      # Fallback: scan any URL
       urls = extract_urls_from_body(body)
       urls.each do |raw|
         next if raw.to_s.empty?
@@ -288,24 +320,41 @@ after_initialize do
         next if uri.nil?
         next if uri.scheme.to_s.empty? || uri.host.to_s.empty?
 
-        scheme = uri.scheme.to_s.downcase
-        host = uri.host.to_s
-
-        port = uri.port.to_i
-        default_port = (scheme == "https" ? 443 : 80)
-        port_part = (port > 0 && port != default_port) ? ":#{port}" : ""
-
-        return "#{scheme}://#{host}#{port_part}"
+        return u
       end
+
       ""
     rescue StandardError
       ""
     end
 
+    # get base URL (scheme://host[:port]) from FIRST found LINK in email body
+    # - HTML: first <a href="...">
+    # - Text: first http(s)://...
+    def self.first_link_base_url_from_message(message)
+      u = first_link_url_from_message(message)
+      return "" if u.to_s.strip.empty?
+
+      uri = (URI.parse(u) rescue nil)
+      return "" if uri.nil?
+      return "" if uri.scheme.to_s.empty? || uri.host.to_s.empty?
+
+      scheme = uri.scheme.to_s.downcase
+      host = uri.host.to_s
+
+      port = uri.port.to_i
+      default_port = (scheme == "https" ? 443 : 80)
+      port_part = (port > 0 && port != default_port) ? ":#{port}" : ""
+
+      "#{scheme}://#{host}#{port_part}"
+    rescue StandardError
+      ""
+    end
+
     def self.first_link_host_from_message(message)
-      base = first_link_base_url_from_message(message)
-      return "" if base.to_s.strip.empty?
-      uri = (URI.parse(base) rescue nil)
+      u = first_link_url_from_message(message)
+      return "" if u.to_s.strip.empty?
+      uri = (URI.parse(u) rescue nil)
       return "" if uri.nil?
       uri.host.to_s.strip
     rescue StandardError
@@ -479,7 +528,7 @@ after_initialize do
 
     # Pixel base:
     #  (1) override domain if provided
-    #  (2) else first found link's domain
+    #  (2) else first found *LINK* (<a href>) domain
     #  (3) else fallback to Discourse.base_url
     def self.resolve_pixel_base_url(mail_message)
       ovr = pixel_domain_override
