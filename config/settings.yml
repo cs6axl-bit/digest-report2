@@ -11,6 +11,11 @@ plugins:
     default: false
     client: true
 
+  digest_report2_pixel_force_discourse_domain:
+    default: false
+    client: false
+    type: bool    
+
   digest_report2_message_id_swap_enabled:
     default: false
     client: true
