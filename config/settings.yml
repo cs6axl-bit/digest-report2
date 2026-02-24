@@ -8,25 +8,17 @@ plugins:
     client: false
 
   digest_report2_open_tracking_enabled:
-    default: true
-    client: true
-
-  digest_report2_pixel_domain_override:
-    default: ""
-    client: false
-
-  digest_report2_message_id_domain_swap_enabled:
     default: false
     client: true
 
-  # NEW: if true, the "origin domain" for Message-ID swapping is the default Discourse hostname
-  digest_report2_message_id_domain_swap_use_default_hostname:
-    default: true
+  digest_report2_message_id_swap_enabled:
+    default: false
     client: true
 
-  # NEW: used only when the checkbox above is OFF
-  # - can be a bare host (example.com) or full URL (https://example.com)
-  # - if blank, swaps regardless of current Message-ID domain (i.e., swaps ANY -> target)
-  digest_report2_message_id_domain_swap_origin_domain:
+  # Optional: if set, this host is used for BOTH:
+  #  - pixel domain
+  #  - Message-ID target domain
+  # If blank: use domain from the first found <a href="http(s)://..."> link in the email.
+  digest_report2_target_domain_override:
     default: ""
-    client: false
+    client: true
