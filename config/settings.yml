@@ -1,0 +1,18 @@
+plugins:
+  digest_report2_enabled:
+    default: true
+    client: true
+
+  digest_report2_endpoint_url:
+    default: "http://172.17.0.1:8081/digest_report.php"
+    client: false
+
+  digest_report2_open_tracking_enabled:
+    default: true
+    client: true
+
+  # Optional: force pixel domain (leave blank to use first link domain)
+  # You may set: example.com  OR  https://example.com
+  digest_report2_pixel_domain_override:
+    default: ""
+    client: true
