@@ -2,7 +2,7 @@
 #
 # name: digest-report2
 # about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel + debug logs + increments user's digest_sent_counter
-# version: 1.10.0
+# version: 1.10.1
 # authors: you
 
 after_initialize do
@@ -49,7 +49,7 @@ after_initialize do
       ""
     end
 
-    # NEW: Message-ID domain swapping switch
+    # Message-ID domain swapping switch
     def self.message_id_domain_swap_enabled?
       return false unless SiteSetting.digest_report2_message_id_domain_swap_enabled
       true
@@ -60,7 +60,6 @@ after_initialize do
     # =========================
     # HARD-CODED SETTINGS (keep here)
     # =========================
-    # If we can't find an email_id in any link, use this
     DEFAULT_EMAIL_ID = "99999999"
 
     # ===== ENCRYPTED TOKEN SETTINGS =====
@@ -293,7 +292,6 @@ after_initialize do
         scheme = uri.scheme.to_s.downcase
         host = uri.host.to_s
 
-        # include port only if non-default
         port = uri.port.to_i
         default_port = (scheme == "https" ? 443 : 80)
         port_part = (port > 0 && port != default_port) ? ":#{port}" : ""
@@ -305,7 +303,6 @@ after_initialize do
       ""
     end
 
-    # NEW: host (domain) from the first found link (no scheme)
     def self.first_link_host_from_message(message)
       base = first_link_base_url_from_message(message)
       return "" if base.to_s.strip.empty?
@@ -316,7 +313,25 @@ after_initialize do
       ""
     end
 
-    # NEW: swap Message-ID domain -> first link host
+    # Prefer override if present; else first-link host; else blank
+    def self.resolve_message_id_target_host(mail_message)
+      ovr = pixel_domain_override.to_s.strip
+      if !ovr.empty?
+        begin
+          s = ovr
+          s = "https://#{s}" unless s =~ %r{\Ahttps?://}i
+          uri = (URI.parse(s) rescue nil)
+          return uri.host.to_s.strip if uri && uri.host.to_s.strip != ""
+        rescue StandardError
+        end
+      end
+
+      first_link_host_from_message(mail_message)
+    rescue StandardError
+      ""
+    end
+
+    # swap Message-ID domain -> target_host
     # Example: <uuid@myhealthyhaven.org> -> <uuid@newdomain.com>
     def self.swap_message_id_domain!(mail_message, target_host)
       return false if mail_message.nil?
@@ -326,7 +341,6 @@ after_initialize do
       raw = header_val(mail_message, "Message-ID")
       return false if raw.empty?
 
-      # Try to normalize: allow with/without angle brackets
       s = raw.strip
       s = s[1..-2].to_s.strip if s.start_with?("<") && s.end_with?(">")
       return false unless s.include?("@")
@@ -336,7 +350,7 @@ after_initialize do
       dom   = dom.to_s.strip
       return false if local.empty? || dom.empty?
 
-      return true if dom.downcase == host.downcase # already swapped
+      return true if dom.downcase == host.downcase
 
       new_mid = "<#{local}@#{host}>"
       mail_message.header["Message-ID"] = new_mid
@@ -464,14 +478,13 @@ after_initialize do
       ""
     end
 
-    # Build pixel base using:
+    # Pixel base:
     #  (1) override domain if provided
     #  (2) else first found link's domain
     #  (3) else fallback to Discourse.base_url
     def self.resolve_pixel_base_url(mail_message)
       ovr = pixel_domain_override
       if !ovr.empty?
-        # accept "example.com" or "https://example.com"
         begin
           s = ovr
           s = "https://#{s}" unless s =~ %r{\Ahttps?://}i
@@ -525,7 +538,6 @@ after_initialize do
       ""
     end
 
-    # Make this domain-agnostic: if email already includes /digest/open with token, don't inject again
     def self.message_already_has_pixel?(mail_message)
       b = extract_email_body(mail_message)
       return false if b.to_s.empty?
@@ -593,7 +605,6 @@ after_initialize do
       false
     end
 
-    # read router headers (per-message)
     def self.read_router_headers(message)
       {
         provider_id:     header_val(message, HDR_PROVIDER_ID),
@@ -607,7 +618,7 @@ after_initialize do
     end
   end
 
-  # BEFORE send: extract email_id + inject pixel + stamp headers + (NEW) Message-ID swap
+  # BEFORE send: extract email_id + inject pixel + stamp headers + Message-ID swap (optional)
   DiscourseEvent.on(:before_email_send) do |message, email_type|
     begin
       next unless ::DigestReport.enabled?
@@ -633,11 +644,11 @@ after_initialize do
         ::DigestReport.dlog("before_email_send: email_id missing -> DEFAULT=#{email_id}")
       end
 
-      # NEW: swap Message-ID domain to first link host (optional switch)
+      # Message-ID: use override host if set; else first-link host
       if ::DigestReport.message_id_domain_swap_enabled?
-        target_host = ::DigestReport.first_link_host_from_message(message)
+        target_host = ::DigestReport.resolve_message_id_target_host(message)
         if target_host.to_s.strip.empty?
-          ::DigestReport.dlog("Message-ID swap: first link host not found -> skip")
+          ::DigestReport.dlog("Message-ID swap: no host resolved -> skip")
         else
           ::DigestReport.swap_message_id_domain!(message, target_host)
         end
@@ -674,7 +685,6 @@ after_initialize do
     end
   end
 
-  # Postback job
   class ::Jobs::DigestReportPostback < ::Jobs::Base
     sidekiq_options queue: "low", retry: ::DigestReport::JOB_RETRY_COUNT
 
@@ -766,7 +776,6 @@ after_initialize do
     end
   end
 
-  # After email send: increment counter + enqueue postback
   DiscourseEvent.on(:after_email_send) do |message, email_type|
     begin
       next unless ::DigestReport.enabled?
