@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: digest-report2
 # about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel + debug logs + increments user's digest_sent_counter
-# version: 1.10.2
+# version: 1.10.3
 # authors: you
 
 after_initialize do
@@ -54,6 +54,21 @@ after_initialize do
       true
     rescue StandardError
       false
+    end
+
+    # NEW: checkbox - use Discourse default hostname as "origin to swap"
+    def self.message_id_domain_swap_use_default_hostname?
+      return false unless SiteSetting.digest_report2_message_id_domain_swap_use_default_hostname
+      true
+    rescue StandardError
+      false
+    end
+
+    # NEW: manual origin domain (only used when checkbox above is OFF)
+    def self.message_id_domain_swap_origin_domain
+      SiteSetting.digest_report2_message_id_domain_swap_origin_domain.to_s.strip
+    rescue StandardError
+      ""
     end
 
     # =========================
@@ -328,9 +343,6 @@ after_initialize do
       ""
     end
 
-    # get base URL (scheme://host[:port]) from FIRST found LINK in email body
-    # - HTML: first <a href="...">
-    # - Text: first http(s)://...
     def self.first_link_base_url_from_message(message)
       u = first_link_url_from_message(message)
       return "" if u.to_s.strip.empty?
@@ -379,9 +391,41 @@ after_initialize do
       ""
     end
 
-    # swap Message-ID domain -> target_host
-    # Example: <uuid@myhealthyhaven.org> -> <uuid@newdomain.com>
-    def self.swap_message_id_domain!(mail_message, target_host)
+    # NEW: resolve origin host for Message-ID swapping
+    # - if checkbox ON: origin = Discourse.base_url host
+    # - else: origin = setting digest_report2_message_id_domain_swap_origin_domain (may be blank)
+    def self.resolve_message_id_origin_host
+      if message_id_domain_swap_use_default_hostname?
+        begin
+          uri = URI.parse(Discourse.base_url.to_s) rescue nil
+          h = uri&.host.to_s.strip
+          return h
+        rescue StandardError
+          return ""
+        end
+      end
+
+      # manual origin host (can be blank => "swap anything")
+      raw = message_id_domain_swap_origin_domain.to_s.strip
+      return "" if raw.empty?
+
+      begin
+        s = raw
+        s = "https://#{s}" unless s =~ %r{\Ahttps?://}i
+        uri = URI.parse(s) rescue nil
+        h = uri&.host.to_s.strip
+        return h if !h.empty?
+      rescue StandardError
+      end
+
+      ""
+    rescue StandardError
+      ""
+    end
+
+    # swap Message-ID domain -> target_host, but ONLY if current domain matches origin_host (unless origin_host blank)
+    # Example: <uuid@old.com> -> <uuid@new.com>
+    def self.swap_message_id_domain!(mail_message, target_host, origin_host: "")
       return false if mail_message.nil?
       host = target_host.to_s.strip
       return false if host.empty?
@@ -398,11 +442,18 @@ after_initialize do
       dom   = dom.to_s.strip
       return false if local.empty? || dom.empty?
 
+      # If origin_host specified, only swap if it matches current dom
+      oh = origin_host.to_s.strip
+      if !oh.empty? && dom.downcase != oh.downcase
+        dlog("Message-ID swap: origin mismatch dom=#{dom} origin=#{oh} -> skip")
+        return false
+      end
+
       return true if dom.downcase == host.downcase
 
       new_mid = "<#{local}@#{host}>"
       mail_message.header["Message-ID"] = new_mid
-      dlog("Message-ID swapped: #{raw} -> #{new_mid}")
+      dlog("Message-ID swapped: #{raw} -> #{new_mid} (origin=#{oh.empty? ? 'ANY' : oh})")
       true
     rescue StandardError => e
       dlog_error("swap_message_id_domain failed err=#{e.class}: #{e.message}")
@@ -692,13 +743,16 @@ after_initialize do
         ::DigestReport.dlog("before_email_send: email_id missing -> DEFAULT=#{email_id}")
       end
 
-      # Message-ID: use override host if set; else first-link host
+      # Message-ID swap:
+      # - target host = override host if set; else first-link host
+      # - origin host = (NEW) default discourse hostname if checkbox ON; else manual origin domain (or blank => any)
       if ::DigestReport.message_id_domain_swap_enabled?
         target_host = ::DigestReport.resolve_message_id_target_host(message)
         if target_host.to_s.strip.empty?
-          ::DigestReport.dlog("Message-ID swap: no host resolved -> skip")
+          ::DigestReport.dlog("Message-ID swap: no target host resolved -> skip")
         else
-          ::DigestReport.swap_message_id_domain!(message, target_host)
+          origin_host = ::DigestReport.resolve_message_id_origin_host
+          ::DigestReport.swap_message_id_domain!(message, target_host, origin_host: origin_host)
         end
       end
 
