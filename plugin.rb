@@ -2,7 +2,7 @@
 
 # name: digest-report2
 # about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel + debug logs + increments user's digest_sent_counter
-# version: 1.8.0
+# version: 1.9.0
 # authors: you
 
 after_initialize do
@@ -19,18 +19,39 @@ after_initialize do
     PLUGIN_NAME = "digest-report2"
 
     # =========================
-    # HARD-CODED SETTINGS (edit here)
+    # SETTINGS (now from SiteSettings)
     # =========================
-    ENABLED = true
+    def self.enabled?
+      return false unless SiteSetting.digest_report2_enabled
+      return false if SiteSetting.digest_report2_endpoint_url.to_s.strip.empty?
+      true
+    rescue StandardError
+      false
+    end
 
-    ENDPOINT_URL = "http://172.17.0.1:8081/digest_report.php"
+    def self.endpoint_url
+      SiteSetting.digest_report2_endpoint_url.to_s.strip
+    rescue StandardError
+      ""
+    end
 
-    # ===== Open tracking switch =====
-    OPEN_TRACKING_ENABLED = true
+    def self.open_tracking_enabled?
+      return false unless SiteSetting.digest_report2_open_tracking_enabled
+      true
+    rescue StandardError
+      false
+    end
 
-    # Pixel endpoint (NO-extension)
-    OPEN_TRACKING_PIXEL_BASE_URL = "#{Discourse.base_url}/digest/open"
+    # Optional override (if set, always used for pixel domain)
+    def self.pixel_domain_override
+      SiteSetting.digest_report2_pixel_domain_override.to_s.strip
+    rescue StandardError
+      ""
+    end
 
+    # =========================
+    # HARD-CODED SETTINGS (keep here)
+    # =========================
     # If we can't find an email_id in any link, use this
     DEFAULT_EMAIL_ID = "99999999"
 
@@ -59,14 +80,14 @@ after_initialize do
     USERNAME_FIELD              = "username"
     USER_CREATED_AT_FIELD       = "user_created_at_utc"
 
-    # NEW: SMTP router fields to PHP
+    # SMTP router fields to PHP
     SMTP_PROVIDER_ID_FIELD      = "provider_id"
     SMTP_PROVIDER_SLOT_FIELD    = "provider_slot"
     SMTP_PROVIDER_WEIGHT_FIELD  = "provider_weight"
     SMTP_ROUTING_REASON_FIELD   = "routing_reason"
     SMTP_ROUTING_UUID_FIELD     = "routing_uuid"
 
-    # NEW: expected headers (set by discourse-multi-smtp-router)
+    # expected headers (set by discourse-multi-smtp-router)
     HDR_PROVIDER_ID     = "X-Multi-SMTP-Router-Provider-Id"
     HDR_PROVIDER_SLOT   = "X-Multi-SMTP-Router-Provider-Slot"
     HDR_PROVIDER_WEIGHT = "X-Multi-SMTP-Router-Provider-Weight"
@@ -112,22 +133,6 @@ after_initialize do
       return unless DEBUG_LOG
       log_error("DEBUG #{msg}")
     rescue StandardError
-    end
-
-    def self.enabled?
-      return false unless ENABLED
-      return false if ENDPOINT_URL.to_s.strip.empty?
-      true
-    rescue StandardError
-      false
-    end
-
-    def self.open_tracking_enabled?
-      return false unless OPEN_TRACKING_ENABLED
-      return false if OPEN_TRACKING_PIXEL_BASE_URL.to_s.strip.empty?
-      true
-    rescue StandardError
-      false
     end
 
     def self.safe_str(v, max_len)
@@ -196,8 +201,6 @@ after_initialize do
 
       User.transaction do
         u = User.lock.find(user.id)
-
-        # Ensure custom_fields are loaded
         u.custom_fields ||= {}
 
         cur_raw = u.custom_fields[field]
@@ -257,22 +260,48 @@ after_initialize do
       end
     end
 
+    def self.extract_urls_from_body(body)
+      return [] if body.to_s.empty?
+      begin
+        b = CGI.unescapeHTML(body.to_s) rescue body.to_s
+        b.scan(%r{https?://[^\s"'<>()]+}i)
+      rescue StandardError
+        []
+      end
+    end
+
+    # NEW: get base URL (scheme://host[:port]) from FIRST found link in email body
+    def self.first_link_base_url_from_message(message)
+      body = extract_email_body(message)
+      urls = extract_urls_from_body(body)
+      urls.each do |raw|
+        next if raw.to_s.empty?
+        u = raw.to_s.gsub(/[)\].,;]+$/, "")
+
+        uri = (URI.parse(u) rescue nil)
+        next if uri.nil?
+        next if uri.scheme.to_s.empty? || uri.host.to_s.empty?
+
+        scheme = uri.scheme.to_s.downcase
+        host = uri.host.to_s
+
+        # include port only if non-default
+        port = uri.port.to_i
+        default_port = (scheme == "https" ? 443 : 80)
+        port_part = (port > 0 && port != default_port) ? ":#{port}" : ""
+
+        return "#{scheme}://#{host}#{port_part}"
+      end
+      ""
+    rescue StandardError
+      ""
+    end
+
     def self.extract_topic_ids_from_message(message)
       body = extract_email_body(message)
       return [] if body.to_s.empty?
 
-      begin
-        body = CGI.unescapeHTML(body.to_s)
-      rescue StandardError
-        body = body.to_s
-      end
-
-      urls =
-        begin
-          body.scan(%r{https?://[^\s"'<>()]+}i)
-        rescue StandardError
-          []
-        end
+      urls = extract_urls_from_body(body)
 
       ids = []
       seen = {}
@@ -308,18 +337,7 @@ after_initialize do
       body = extract_email_body(message)
       return "" if body.to_s.empty?
 
-      begin
-        body = CGI.unescapeHTML(body.to_s)
-      rescue StandardError
-        body = body.to_s
-      end
-
-      urls =
-        begin
-          body.scan(%r{https?://[^\s"'<>()]+}i)
-        rescue StandardError
-          []
-        end
+      urls = extract_urls_from_body(body)
 
       urls.each do |raw|
         next if raw.to_s.empty?
@@ -396,9 +414,39 @@ after_initialize do
       ""
     end
 
-    def self.build_tracking_pixel_html(email_id:, user_id:, user_email:)
-      base = OPEN_TRACKING_PIXEL_BASE_URL.to_s.strip
-      return "" if base.empty?
+    # NEW: Build pixel base using:
+    #  (1) override domain if provided
+    #  (2) else first found link's domain
+    #  (3) else fallback to Discourse.base_url
+    def self.resolve_pixel_base_url(mail_message)
+      ovr = pixel_domain_override
+      if !ovr.empty?
+        # accept "example.com" or "https://example.com"
+        begin
+          s = ovr
+          s = "https://#{s}" unless s =~ %r{\Ahttps?://}i
+          uri = URI.parse(s) rescue nil
+          if uri && uri.scheme.to_s != "" && uri.host.to_s != ""
+            scheme = uri.scheme.to_s.downcase
+            host = uri.host.to_s
+            port = uri.port.to_i
+            default_port = (scheme == "https" ? 443 : 80)
+            port_part = (port > 0 && port != default_port) ? ":#{port}" : ""
+            return "#{scheme}://#{host}#{port_part}"
+          end
+        rescue StandardError
+        end
+      end
+
+      from_link = first_link_base_url_from_message(mail_message)
+      return from_link unless from_link.empty?
+
+      Discourse.base_url.to_s
+    rescue StandardError
+      Discourse.base_url.to_s
+    end
+
+    def self.build_tracking_pixel_html(mail_message, email_id:, user_id:, user_email:)
       return "" if email_id.to_s.strip.empty?
 
       t = build_open_token(email_id: email_id, user_id: user_id, user_email: user_email)
@@ -406,15 +454,20 @@ after_initialize do
 
       t = t.to_s[0, TOKEN_MAX_LEN]
 
+      base = resolve_pixel_base_url(mail_message).to_s.strip
+      return "" if base.empty?
+
+      pixel_base = "#{base}/digest/open"
+
       url =
         begin
-          uri = URI.parse(base)
+          uri = URI.parse(pixel_base)
           existing = uri.query.to_s
           add = URI.encode_www_form({ "t" => t })
           uri.query = existing.empty? ? add : "#{existing}&#{add}"
           uri.to_s
         rescue StandardError
-          "#{base}?#{URI.encode_www_form({ "t" => t })}"
+          "#{pixel_base}?#{URI.encode_www_form({ "t" => t })}"
         end
 
       %Q(<img src="#{CGI.escapeHTML(url)}" width="1" height="1" style="display:none!important;max-height:0;overflow:hidden" alt="" />)
@@ -422,14 +475,11 @@ after_initialize do
       ""
     end
 
+    # Make this domain-agnostic: if email already includes /digest/open with token, don't inject again
     def self.message_already_has_pixel?(mail_message)
       b = extract_email_body(mail_message)
       return false if b.to_s.empty?
-
-      base = OPEN_TRACKING_PIXEL_BASE_URL.to_s.strip
-      legacy = base.end_with?("/digest/open") ? (base + ".gif") : "#{Discourse.base_url}/digest/open.gif"
-
-      b.include?(base) || b.include?(legacy) || b.include?("digest/open?t=")
+      b.include?("/digest/open?t=") || b.include?("digest/open?t=") || b.include?("/digest/open.gif") || b.include?("digest/open.gif")
     rescue StandardError
       false
     end
@@ -437,9 +487,9 @@ after_initialize do
     def self.inject_pixel_into_mail!(mail_message, email_id:, user_id:, user_email:)
       return false if mail_message.nil?
 
-      pixel = build_tracking_pixel_html(email_id: email_id, user_id: user_id, user_email: user_email)
+      pixel = build_tracking_pixel_html(mail_message, email_id: email_id, user_id: user_id, user_email: user_email)
       if pixel.to_s.empty?
-        dlog("inject: pixel html empty (missing token/key?) -> fail")
+        dlog("inject: pixel html empty (missing token/key? base url?) -> fail")
         return false
       end
 
@@ -493,7 +543,7 @@ after_initialize do
       false
     end
 
-    # NEW: read router headers (per-message)
+    # read router headers (per-message)
     def self.read_router_headers(message)
       {
         provider_id:     header_val(message, HDR_PROVIDER_ID),
@@ -564,7 +614,7 @@ after_initialize do
     end
   end
 
-  # Postback job (UPDATED to include provider fields)
+  # Postback job
   class ::Jobs::DigestReportPostback < ::Jobs::Base
     sidekiq_options queue: "low", retry: ::DigestReport::JOB_RETRY_COUNT
 
@@ -572,7 +622,7 @@ after_initialize do
       begin
         return unless ::DigestReport.enabled?
 
-        url = ::DigestReport::ENDPOINT_URL.to_s.strip
+        url = ::DigestReport.endpoint_url
         email_id = args[:email_id].to_s.strip
         email_id = ::DigestReport::DEFAULT_EMAIL_ID if email_id.empty?
 
@@ -602,7 +652,6 @@ after_initialize do
         topic_ids_count = topic_ids_ordered.length
         first_topic_id  = topic_ids_ordered[0] ? topic_ids_ordered[0].to_s : ""
 
-        # NEW: provider routing fields
         provider_id     = args[:provider_id].to_s.strip
         provider_slot   = args[:provider_slot].to_s.strip
         provider_weight = args[:provider_weight].to_s.strip
@@ -630,7 +679,6 @@ after_initialize do
           [::DigestReport::TOPIC_COUNT_FIELD, topic_ids_count.to_s],
           [::DigestReport::FIRST_TOPIC_ID_FIELD, first_topic_id],
 
-          # NEW: send SMTP routing info to PHP
           [::DigestReport::SMTP_PROVIDER_ID_FIELD, provider_id],
           [::DigestReport::SMTP_PROVIDER_SLOT_FIELD, provider_slot],
           [::DigestReport::SMTP_PROVIDER_WEIGHT_FIELD, provider_weight],
@@ -676,10 +724,7 @@ after_initialize do
         user = nil
       end
 
-      # +1 digest_sent_counter (create if missing -> becomes "1")
-      if user
-        ::DigestReport.increment_digest_counter_for_user(user)
-      end
+      ::DigestReport.increment_digest_counter_for_user(user) if user
 
       uid = user ? user.id : 0
       user_id = user ? user.id : ""
@@ -698,7 +743,6 @@ after_initialize do
       open_tracking_used = ::DigestReport.header_val(message, "X-Digest-Report-Open-Tracking-Used")
       open_tracking_used = (open_tracking_used == "1" ? "1" : "0")
 
-      # NEW: read router headers stamped by multi-smtp-router
       router = ::DigestReport.read_router_headers(message)
 
       Jobs.enqueue(
@@ -712,8 +756,6 @@ after_initialize do
         user_created_at_utc: user_created_at_utc,
         subject: subject,
         topic_ids: topic_ids,
-
-        # NEW: pass through to job -> PHP
         provider_id: router[:provider_id],
         provider_slot: router[:provider_slot],
         provider_weight: router[:provider_weight],
