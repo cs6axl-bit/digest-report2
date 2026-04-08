@@ -14,7 +14,7 @@ plugins:
   digest_report2_pixel_force_discourse_domain:
     default: false
     client: false
-    type: bool    
+    type: bool
 
   digest_report2_message_id_swap_enabled:
     default: false
@@ -27,3 +27,11 @@ plugins:
   digest_report2_target_domain_override:
     default: ""
     client: true
+
+  # If true, each sent digest is also inserted into a local PostgreSQL table
+  # (digest_report_logs). The table is auto-created if missing and the discourse
+  # DB user is granted full privileges on it. Independent of the HTTP endpoint switch.
+  digest_report2_local_pg_enabled:
+    default: false
+    client: false
+    type: bool
