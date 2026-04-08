@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: digest-report2
 # about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel + optional Message-ID domain swap + optional switch to force pixel to use Discourse base_url + debug logs + increments user's digest_sent_counter + optional local PostgreSQL logging
-# version: 1.13.0
+# version: 1.14.0
 # authors: you
 
 after_initialize do
@@ -46,7 +46,6 @@ after_initialize do
       false
     end
 
-    # NEW:
     # If true, tracking pixel URL ALWAYS uses Discourse.base_url (default Discourse domain),
     # ignoring override/first-link swapping rules.
     # If false, pixel follows the existing "swap/target domain" resolution rules.
@@ -399,7 +398,6 @@ after_initialize do
     end
 
     # Pixel base URL:
-    # NEW switch:
     # - if pixel_force_discourse_domain? -> ALWAYS Discourse.base_url
     # - else:
     #   - if override present -> use https://override (or scheme if provided)
@@ -701,33 +699,97 @@ after_initialize do
     # LOCAL POSTGRES LOGGING
     # =========================
 
-    # Creates the digest_report_logs table if it doesn't exist and grants the
-    # discourse DB user full privileges on it. Only runs DDL once per process lifetime.
+    # Mirror the PHP endpoint's is_campaign_email_id() logic:
+    #   - must start with "0000"
+    #   - must have another "000" at index 7 or later
+    def self.campaign_email_id?(email_id)
+      s = email_id.to_s
+      return false unless s.start_with?("0000")
+      !s.index("000", 7).nil?
+    rescue StandardError
+      false
+    end
+
+    # Mirror the PHP endpoint's extract_campaignid_from_email_id() logic:
+    #   campaignid = s[4 .. (pos_of_second_000 - 1)]
+    def self.extract_campaignid(email_id)
+      s = email_id.to_s
+      return "" unless s.start_with?("0000")
+      pos = s.index("000", 7)
+      return "" if pos.nil?
+      len = pos - 4
+      return "" if len <= 0
+      cid = s[4, len]
+      cid.length > 64 ? cid[0, 64] : cid
+    rescue StandardError
+      ""
+    end
+
+    # email_id must be exactly 20 digits (same rule as PHP validation).
+    # The DEFAULT_EMAIL_ID (8 digits) intentionally fails this check
+    # so stubs are never written to the table.
+    def self.email_id_loggable?(email_id)
+      !!(email_id.to_s =~ /\A\d{20}\z/)
+    rescue StandardError
+      false
+    end
+
+    # Parse an ISO-8601 / HTTP-date string to a UTC Time, or nil on failure.
+    def self.parse_utc_datetime(str)
+      return nil if str.to_s.strip.empty?
+      Time.parse(str.to_s.strip).utc
+    rescue StandardError
+      nil
+    end
+
+    # Creates (or verifies) the digest_report_logs table and grants the
+    # discourse DB role full privileges. Schema matches the PHP MySQL table.
+    # Called once per process lifetime via @pg_table_ensured guard.
     def self.ensure_pg_table!
       return if @pg_table_ensured
       conn = ActiveRecord::Base.connection
       conn.execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{PG_TABLE_NAME} (
-          id               BIGSERIAL PRIMARY KEY,
-          created_at       TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
-          email_id         VARCHAR(100),
-          open_tracking    SMALLINT NOT NULL DEFAULT 0,
-          user_email       VARCHAR(300),
-          from_email       VARCHAR(300),
-          user_id          INTEGER,
-          username         VARCHAR(300),
-          user_created_at  TIMESTAMP WITHOUT TIME ZONE,
-          subject          VARCHAR(400),
-          topic_ids        TEXT,
-          topic_ids_count  INTEGER NOT NULL DEFAULT 0,
-          first_topic_id   INTEGER,
-          provider_id      VARCHAR(200),
-          provider_slot    VARCHAR(200),
-          provider_weight  VARCHAR(200),
-          routing_reason   TEXT,
-          routing_uuid     VARCHAR(200)
+          id                   BIGSERIAL PRIMARY KEY,
+          email_id             VARCHAR(20)  NOT NULL,
+          open_tracking_used   SMALLINT     NOT NULL DEFAULT 0,
+          isopened             SMALLINT     NOT NULL DEFAULT 0,
+          isclicked            SMALLINT     NOT NULL DEFAULT 0,
+          iscampaign           SMALLINT     NOT NULL DEFAULT 0,
+          campaignid           VARCHAR(64),
+          user_email           VARCHAR(255),
+          from_email           VARCHAR(255),
+          user_id              VARCHAR(32),
+          username             VARCHAR(255),
+          user_created_at_utc  VARCHAR(40),
+          user_created_at_dt   TIMESTAMP WITHOUT TIME ZONE,
+          subject              VARCHAR(512),
+          subject_present      SMALLINT     NOT NULL DEFAULT 0,
+          topic_ids            TEXT,
+          topic_ids_count      INTEGER      NOT NULL DEFAULT 0,
+          first_topic_id       BIGINT,
+          provider_id          VARCHAR(128),
+          provider_slot        VARCHAR(128),
+          provider_weight      VARCHAR(128),
+          routing_reason       TEXT,
+          routing_uuid         VARCHAR(200),
+          recv_useragent       VARCHAR(512),
+          recv_user_ip         VARCHAR(64),
+          created_at           TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
+          CONSTRAINT uq_#{PG_TABLE_NAME}_email_id UNIQUE (email_id)
         )
       SQL
+      [
+        "CREATE INDEX IF NOT EXISTS idx_drl_user_email          ON #{PG_TABLE_NAME} (user_email)",
+        "CREATE INDEX IF NOT EXISTS idx_drl_user_id             ON #{PG_TABLE_NAME} (user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_drl_first_topic_id      ON #{PG_TABLE_NAME} (first_topic_id)",
+        "CREATE INDEX IF NOT EXISTS idx_drl_open_tracking_used  ON #{PG_TABLE_NAME} (open_tracking_used)",
+        "CREATE INDEX IF NOT EXISTS idx_drl_isopened            ON #{PG_TABLE_NAME} (isopened)",
+        "CREATE INDEX IF NOT EXISTS idx_drl_isclicked           ON #{PG_TABLE_NAME} (isclicked)",
+        "CREATE INDEX IF NOT EXISTS idx_drl_iscampaign          ON #{PG_TABLE_NAME} (iscampaign)",
+        "CREATE INDEX IF NOT EXISTS idx_drl_campaignid          ON #{PG_TABLE_NAME} (campaignid)",
+        "CREATE INDEX IF NOT EXISTS idx_drl_provider_id         ON #{PG_TABLE_NAME} (provider_id)",
+      ].each { |sql| conn.execute(sql) }
       conn.execute("GRANT ALL PRIVILEGES ON TABLE #{PG_TABLE_NAME} TO discourse")
       conn.execute("GRANT USAGE, SELECT ON SEQUENCE #{PG_TABLE_NAME}_id_seq TO discourse")
       @pg_table_ensured = true
@@ -738,41 +800,48 @@ after_initialize do
 
     def self.insert_pg_log(
       email_id:, open_tracking_used:, user_email:, from_email:,
-      user_id:, username:, user_created_at_utc:, subject:,
+      user_id:, username:, user_created_at_utc:, user_created_at_dt:,
+      subject:, subject_present:,
       topic_ids_csv:, topic_ids_count:, first_topic_id:,
       provider_id:, provider_slot:, provider_weight:,
-      routing_reason:, routing_uuid:
+      routing_reason:, routing_uuid:,
+      iscampaign:, campaignid:
     )
       conn = ActiveRecord::Base.connection
       q    = ->(v) { conn.quote(v) }
 
-      uid_s   = user_id.to_s.strip
-      uid_val = (uid_s.empty? ? "NULL" : q.call(uid_s.to_i))
-
-      fid_s   = first_topic_id.to_s.strip
-      fid_val = (fid_s.empty? ? "NULL" : q.call(fid_s.to_i))
-
-      uat_s   = user_created_at_utc.to_s.strip
-      uat_val = (uat_s.empty? ? "NULL" : q.call(uat_s))
-
-      ot_val  = (open_tracking_used.to_s == "1" ? 1 : 0)
+      uid_val  = user_id.to_s.strip.empty?     ? "NULL" : q.call(user_id.to_s.strip)
+      fid_val  = first_topic_id.to_s.strip.empty? ? "NULL" : q.call(first_topic_id.to_s.strip.to_i)
+      uat_val  = user_created_at_dt.nil?        ? "NULL" : q.call(user_created_at_dt.strftime("%Y-%m-%d %H:%M:%S"))
+      cid_val  = campaignid.to_s.empty?         ? "NULL" : q.call(campaignid.to_s)
+      ot_val   = open_tracking_used.to_s == "1" ? 1 : 0
+      sp_val   = subject_present.to_s == "1"    ? 1 : 0
 
       conn.execute(<<~SQL)
         INSERT INTO #{PG_TABLE_NAME} (
-          email_id, open_tracking, user_email, from_email,
-          user_id, username, user_created_at, subject,
+          email_id, open_tracking_used, isopened, isclicked,
+          iscampaign, campaignid,
+          user_email, from_email, user_id, username,
+          user_created_at_utc, user_created_at_dt,
+          subject, subject_present,
           topic_ids, topic_ids_count, first_topic_id,
           provider_id, provider_slot, provider_weight,
-          routing_reason, routing_uuid
+          routing_reason, routing_uuid,
+          recv_useragent, recv_user_ip
         ) VALUES (
-          #{q.call(email_id.to_s)}, #{q.call(ot_val)}, #{q.call(user_email.to_s)}, #{q.call(from_email.to_s)},
-          #{uid_val}, #{q.call(username.to_s)}, #{uat_val}, #{q.call(subject.to_s)},
+          #{q.call(email_id.to_s)}, #{q.call(ot_val)}, 0, 0,
+          #{q.call(iscampaign ? 1 : 0)}, #{cid_val},
+          #{q.call(user_email.to_s)}, #{q.call(from_email.to_s)}, #{uid_val}, #{q.call(username.to_s)},
+          #{q.call(user_created_at_utc.to_s)}, #{uat_val},
+          #{q.call(subject.to_s)}, #{q.call(sp_val)},
           #{q.call(topic_ids_csv.to_s)}, #{q.call(topic_ids_count.to_i)}, #{fid_val},
           #{q.call(provider_id.to_s)}, #{q.call(provider_slot.to_s)}, #{q.call(provider_weight.to_s)},
-          #{q.call(routing_reason.to_s)}, #{q.call(routing_uuid.to_s)}
+          #{q.call(routing_reason.to_s)}, #{q.call(routing_uuid.to_s)},
+          #{q.call("Discourse/#{Discourse::VERSION::STRING rescue "?"} #{PLUGIN_NAME}")}, NULL
         )
+        ON CONFLICT (email_id) DO NOTHING
       SQL
-      dlog("insert_pg_log: OK email_id=#{email_id} user_email=#{user_email}")
+      dlog("insert_pg_log: OK email_id=#{email_id} iscampaign=#{iscampaign ? 1 : 0} campaignid=#{campaignid}")
     rescue StandardError => e
       log_error("insert_pg_log failed err=#{e.class}: #{e.message}")
     end
@@ -944,25 +1013,38 @@ after_initialize do
 
         # ---- Insert into local PostgreSQL table ----
         if do_pg
-          ::DigestReport.ensure_pg_table!
-          ::DigestReport.insert_pg_log(
-            email_id:            email_id,
-            open_tracking_used:  open_tracking_used,
-            user_email:          user_email,
-            from_email:          from_email,
-            user_id:             user_id,
-            username:            username,
-            user_created_at_utc: user_created_at_utc,
-            subject:             subject,
-            topic_ids_csv:       topic_ids_csv,
-            topic_ids_count:     topic_ids_count,
-            first_topic_id:      first_topic_id,
-            provider_id:         provider_id,
-            provider_slot:       provider_slot,
-            provider_weight:     provider_weight,
-            routing_reason:      routing_reason,
-            routing_uuid:        routing_uuid
-          )
+          # Skip stubs (DEFAULT_EMAIL_ID is 8 digits; valid ids are exactly 20 digits)
+          if ::DigestReport.email_id_loggable?(email_id)
+            iscampaign     = ::DigestReport.campaign_email_id?(email_id)
+            campaignid     = iscampaign ? ::DigestReport.extract_campaignid(email_id) : ""
+            user_created_at_dt = ::DigestReport.parse_utc_datetime(user_created_at_utc)
+
+            ::DigestReport.ensure_pg_table!
+            ::DigestReport.insert_pg_log(
+              email_id:            email_id,
+              open_tracking_used:  open_tracking_used,
+              user_email:          user_email,
+              from_email:          from_email,
+              user_id:             user_id,
+              username:            username,
+              user_created_at_utc: user_created_at_utc,
+              user_created_at_dt:  user_created_at_dt,
+              subject:             subject,
+              subject_present:     subject_present,
+              topic_ids_csv:       topic_ids_csv,
+              topic_ids_count:     topic_ids_count,
+              first_topic_id:      first_topic_id,
+              provider_id:         provider_id,
+              provider_slot:       provider_slot,
+              provider_weight:     provider_weight,
+              routing_reason:      routing_reason,
+              routing_uuid:        routing_uuid,
+              iscampaign:          iscampaign,
+              campaignid:          campaignid
+            )
+          else
+            ::DigestReport.dlog("insert_pg_log: skip email_id=#{email_id} (not 20 digits)")
+          end
         end
 
       rescue StandardError => e
