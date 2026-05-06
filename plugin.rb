@@ -83,6 +83,11 @@ after_initialize do
     # ===== DEBUG LOGGING =====
     DEBUG_LOG = true
 
+    # ===== UNSUBSCRIBE LINK email_id APPEND =====
+    # When true, appends ?email_id=VALUE (or &email_id=VALUE) to every
+    # /email/unsubscribe link in the digest HTML before sending.
+    UNSUB_APPEND_EMAIL_ID = true
+
     # ===== LOCAL POSTGRES LOGGING =====
     PG_TABLE_NAME = "digest_report_logs"
 
@@ -683,6 +688,66 @@ after_initialize do
       false
     end
 
+    # Appends ?email_id=VALUE (or &email_id=VALUE) to every /email/unsubscribe
+    # href in the HTML part. Skips links that already carry the parameter.
+    def self.append_email_id_to_unsubscribe_links!(mail_message, email_id:)
+      return false if mail_message.nil?
+      eid = email_id.to_s.strip
+      return false if eid.empty?
+
+      rewrite = lambda do |html|
+        html.gsub(/(href\s*=\s*["'])(https?:\/\/[^"']*\/email\/unsubscribe[^"']*)(?=["'])/i) do
+          prefix = $1
+          url    = $2
+          next "#{prefix}#{url}" if url.include?("email_id=")
+          begin
+            uri = URI.parse(url)
+            sep = uri.query.to_s.empty? ? "?" : "&"
+            "#{prefix}#{url}#{sep}email_id=#{CGI.escape(eid)}"
+          rescue StandardError
+            "#{prefix}#{url}"
+          end
+        end
+      end
+
+      begin
+        if mail_message.respond_to?(:multipart?) && mail_message.multipart?
+          hp = mail_message.html_part rescue nil
+          unless hp.nil?
+            html = (hp.body.decoded.to_s rescue "")
+            unless html.empty?
+              new_html = rewrite.call(html)
+              if new_html != html
+                hp.body = new_html rescue nil
+                dlog("unsub_append: OK via html_part email_id=#{eid}")
+                return true
+              end
+            end
+          end
+        else
+          ct = (mail_message.content_type.to_s rescue "")
+          if ct.downcase.include?("text/html")
+            html = (mail_message.body.decoded.to_s rescue "")
+            unless html.empty?
+              new_html = rewrite.call(html)
+              if new_html != html
+                mail_message.body = new_html rescue nil
+                dlog("unsub_append: OK via body email_id=#{eid}")
+                return true
+              end
+            end
+          end
+        end
+      rescue StandardError => e
+        dlog_error("unsub_append: err=#{e.class}: #{e.message}")
+      end
+
+      false
+    rescue StandardError => e
+      dlog_error("unsub_append: crash err=#{e.class}: #{e.message}")
+      false
+    end
+
     def self.read_router_headers(message)
       {
         provider_id:     header_val(message, HDR_PROVIDER_ID),
@@ -905,6 +970,10 @@ after_initialize do
         open_tracking_used: open_used,
         user_id: uid
       )
+
+      if ::DigestReport::UNSUB_APPEND_EMAIL_ID && email_id.to_s != ::DigestReport::DEFAULT_EMAIL_ID
+        ::DigestReport.append_email_id_to_unsubscribe_links!(message, email_id: email_id)
+      end
 
       ::DigestReport.dlog(
         "before_email_send: uid=#{uid} email=#{recipient} email_id=#{email_id} " \
