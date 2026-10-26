@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: digest-report2
 # about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel + optional Message-ID domain swap + optional switch to force pixel to use Discourse base_url + debug logs + increments user's digest_sent_counter + optional local PostgreSQL logging
-# version: 1.14.0
+# version: 1.14.1
 # authors: you
 
 after_initialize do
@@ -780,7 +780,10 @@ after_initialize do
     def self.extract_campaignid(email_id)
       s = email_id.to_s
       return "" unless s.start_with?("0000")
-      pos = s.index("000", 7)
+      # 2026-10-26: first "000" (index >= 5) followed by a NON-zero digit (digest-campaigns 1.12.1 ids never have a random
+      # part starting with 0), else the old rule. Ids ending in 0 ("1070" + "000") used to be cut short (107).
+      pos = (5...(s.length - 3)).find { |i| s[i, 3] == "000" && s[i + 3] != "0" }
+      pos ||= s.index("000", 7)
       return "" if pos.nil?
       len = pos - 4
       return "" if len <= 0
